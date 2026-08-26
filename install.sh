@@ -20,6 +20,29 @@ need_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
+is_yes() {
+  local answer="${1//$'\r'/}"
+
+  case "$answer" in
+    yes|YES|Yes|y|Y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+flush_pending_input() {
+  local char
+
+  while IFS= read -r -s -n 1 -t 0.05 char; do
+    if [ "$char" = $'\n' ] || [ "$char" = $'\r' ]; then
+      break
+    fi
+  done
+}
+
 detect_server_ip() {
   local ip=""
 
@@ -233,7 +256,7 @@ uninstall_panel() {
   echo "This will stop and remove the panel containers for:"
   echo "$PROJECT_DIR"
   read -r -p "Type yes to continue: " confirmed
-  if [ "$confirmed" != "yes" ]; then
+  if ! is_yes "$confirmed"; then
     echo "Canceled."
     return
   fi
@@ -246,7 +269,7 @@ uninstall_panel() {
     fi
 
     read -r -p "Also remove Docker volumes and saved panel/WireGuard data? Type yes to remove data: " remove_data
-    if [ "$remove_data" = "yes" ]; then
+    if is_yes "$remove_data"; then
       $SUDO docker compose "${compose_env_args[@]}" down -v --remove-orphans
     else
       $SUDO docker compose "${compose_env_args[@]}" down --remove-orphans
@@ -256,7 +279,7 @@ uninstall_panel() {
   fi
 
   read -r -p "Remove project directory from disk too? Type yes to remove files: " remove_project
-  if [ "$remove_project" = "yes" ]; then
+  if is_yes "$remove_project"; then
     case "$PROJECT_DIR" in
       ""|"/"|"$HOME"|"$HOME/")
         echo "Refusing to remove unsafe PROJECT_DIR: $PROJECT_DIR"
@@ -302,7 +325,7 @@ show_menu() {
   echo "1) Install panel"
   echo "2) Panel information"
   echo "3) Uninstall panel"
-  echo "0) Exit"
+  echo "4) Exit"
   echo
 }
 
@@ -318,6 +341,7 @@ main() {
     show_menu
     read -r -s -n 1 -p "Press a number: " choice
     echo
+    flush_pending_input
 
     case "$choice" in
       1)
@@ -332,7 +356,7 @@ main() {
         uninstall_panel
         pause_for_menu
         ;;
-      0|q|Q)
+      4|0|q|Q)
         echo "Bye."
         exit 0
         ;;
