@@ -66,6 +66,7 @@ ensure_ssh_key() {
   cat "$DEPLOY_KEY_PATH.pub"
   echo
 
+
   read -r -p "Did you add this key to the repository Deploy keys? Type yes to continue: " confirmed
   if [ "$confirmed" != "yes" ]; then
     echo "Stopped. Run this script again after adding the key to GitHub."
