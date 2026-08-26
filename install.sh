@@ -44,6 +44,7 @@ install_base_packages() {
   fi
 
   $SUDO apt-get update
+  $SUDO apt-get upgrade -y
   $SUDO apt-get install -y ca-certificates curl git openssh-client openssl
 }
 
@@ -150,7 +151,131 @@ start_stack() {
   $SUDO docker compose --env-file .env up -d --build
 }
 
-main() {
+env_value() {
+  local key="$1"
+  local env_file="$PROJECT_DIR/.env"
+
+  if [ ! -f "$env_file" ]; then
+    return 0
+  fi
+
+  grep "^${key}=" "$env_file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true
+}
+
+show_admin_users() {
+  if [ ! -d "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    echo "Admin list: panel project was not found."
+    return
+  fi
+
+  if ! need_command docker; then
+    echo "Admin list: Docker is not installed."
+    return
+  fi
+
+  cd "$PROJECT_DIR"
+
+  if ! $SUDO docker compose ps mysql >/dev/null 2>&1; then
+    echo "Admin list: MySQL container is not available."
+    return
+  fi
+
+  if ! $SUDO docker compose exec -T mysql mysql \
+    -u wg_easy \
+    -pwg_easy_password \
+    wg_easy \
+    -e "SELECT username, role, COALESCE(password_plaintext, '') AS password, created_at FROM admin_users ORDER BY role DESC, username;" 2>/dev/null; then
+    echo "Admin list: could not read admin_users table. The panel may not be initialized yet."
+  fi
+}
+
+show_panel_info() {
+  local server_host panel_port wg_port panel_url password_hash
+
+  server_host="$(env_value WG_HOST)"
+  panel_port="$(env_value PANEL_PORT)"
+  wg_port="$(env_value WG_PUBLISHED_PORT)"
+  password_hash="$(env_value PASSWORD_HASH)"
+
+  if [ -z "$server_host" ]; then
+    server_host="$(detect_server_ip)"
+  fi
+  panel_port="${panel_port:-$PANEL_PORT}"
+  wg_port="${wg_port:-$WG_PORT}"
+
+  if [ -n "$server_host" ]; then
+    panel_url="http://$server_host:$panel_port"
+  else
+    panel_url="Unknown. WG_HOST was not detected and .env was not found."
+  fi
+
+  echo
+  echo "Panel information"
+  echo "-----------------"
+  echo "Panel URL: $panel_url"
+  echo "Project directory: $PROJECT_DIR"
+  echo "Panel TCP port: $panel_port"
+  echo "WireGuard UDP port: $wg_port"
+  if [ -n "$password_hash" ]; then
+    echo "Password hash: $password_hash"
+    echo "Plain password: cannot be recovered from PASSWORD_HASH."
+  else
+    echo "Password hash: not found in $PROJECT_DIR/.env"
+  fi
+  echo
+  show_admin_users
+}
+
+uninstall_panel() {
+  local confirmed remove_data remove_project
+
+  echo
+  echo "This will stop and remove the panel containers for:"
+  echo "$PROJECT_DIR"
+  read -r -p "Type yes to continue: " confirmed
+  if [ "$confirmed" != "yes" ]; then
+    echo "Canceled."
+    return
+  fi
+
+  if [ -d "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    cd "$PROJECT_DIR"
+    local compose_env_args=()
+    if [ -f ".env" ]; then
+      compose_env_args=(--env-file .env)
+    fi
+
+    read -r -p "Also remove Docker volumes and saved panel/WireGuard data? Type yes to remove data: " remove_data
+    if [ "$remove_data" = "yes" ]; then
+      $SUDO docker compose "${compose_env_args[@]}" down -v --remove-orphans
+    else
+      $SUDO docker compose "${compose_env_args[@]}" down --remove-orphans
+    fi
+  else
+    echo "Project directory or docker-compose.yml was not found."
+  fi
+
+  read -r -p "Remove project directory from disk too? Type yes to remove files: " remove_project
+  if [ "$remove_project" = "yes" ]; then
+    case "$PROJECT_DIR" in
+      ""|"/"|"$HOME"|"$HOME/")
+        echo "Refusing to remove unsafe PROJECT_DIR: $PROJECT_DIR"
+        ;;
+      *)
+        if [ -f "$PROJECT_DIR/docker-compose.yml" ] || [ -d "$PROJECT_DIR/.git" ]; then
+          rm -rf -- "$PROJECT_DIR"
+          echo "Project directory removed."
+        else
+          echo "Refusing to remove PROJECT_DIR because it does not look like this panel project."
+        fi
+        ;;
+    esac
+  fi
+
+  echo "Panel removal finished."
+}
+
+install_panel() {
   install_base_packages
   ensure_ssh_key
   ensure_docker
@@ -168,6 +293,43 @@ main() {
   echo
   echo "WireGuard UDP port: $WG_PORT"
   echo "Project directory: $PROJECT_DIR"
+}
+
+show_menu() {
+  echo
+  echo "Pasha Forever WireGuard"
+  echo "-----------------------"
+  echo "1) نصب پنل"
+  echo "2) مشخصات پنل"
+  echo "3) پاک کردن پنل"
+  echo "0) خروج"
+  echo
+}
+
+main() {
+  local choice
+
+  show_menu
+  read -r -p "گزینه را وارد کنید: " choice
+
+  case "$choice" in
+    1)
+      install_panel
+      ;;
+    2)
+      show_panel_info
+      ;;
+    3)
+      uninstall_panel
+      ;;
+    0|q|Q)
+      echo "Bye."
+      ;;
+    *)
+      echo "Invalid option."
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
