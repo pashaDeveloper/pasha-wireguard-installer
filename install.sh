@@ -472,7 +472,7 @@ install_panel() {
   ensure_ssh_key
   ensure_docker
   clone_or_update_repo
-  server_host="$(choose_panel_host "$(detect_server_ip)")"
+  server_host="$(detect_server_ip)"
   write_server_env "$server_host"
   open_firewall_ports
   start_stack
