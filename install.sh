@@ -15,8 +15,14 @@ ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
 ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
 INSTALL_INFO_DIR="${INSTALL_INFO_DIR:-/etc/pasha-panel}"
 INSTALL_INFO_FILE="${INSTALL_INFO_FILE:-$INSTALL_INFO_DIR/install.env}"
+NGINX_SITE_NAME="${NGINX_SITE_NAME:-pasha-panel}"
+NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+NGINX_ENABLED_DIR="${NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+NGINX_SITE_FILE="${NGINX_SITE_FILE:-$NGINX_AVAILABLE_DIR/$NGINX_SITE_NAME.conf}"
+NGINX_ENABLED_FILE="${NGINX_ENABLED_FILE:-$NGINX_ENABLED_DIR/$NGINX_SITE_NAME.conf}"
 REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
 PANEL_CERT_ENABLED=0
+NGINX_WAS_ACTIVE=0
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -71,6 +77,11 @@ install_base_packages() {
   $SUDO apt-get install -y ca-certificates curl git openssh-client openssl socat
 }
 
+install_ssl_packages() {
+  install_base_packages
+  $SUDO apt-get install -y nginx
+}
+
 load_install_info() {
   if [ -f "$INSTALL_INFO_FILE" ]; then
     # shellcheck disable=SC1090
@@ -91,7 +102,7 @@ choose_panel_host() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    read -r -p "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host): " panel_domain
+    read -r -p "Enter panel domain for WG_HOST, or press Enter to use detected IP ($detected_host): " panel_domain
   fi
 
   if [ -n "$panel_domain" ]; then
@@ -104,6 +115,33 @@ choose_panel_host() {
   else
     printf '%s' "$detected_host"
   fi
+}
+
+choose_certificate_domain() {
+  local panel_domain="$PANEL_DOMAIN"
+
+  echo >&2
+  if [ -z "$panel_domain" ]; then
+    read -r -p "Enter panel domain for SSL (example: panel.example.com): " panel_domain
+  fi
+
+  if [ -z "$panel_domain" ]; then
+    echo "ERROR: A domain is required for Let's Encrypt." >&2
+    exit 1
+  fi
+
+  if is_ipv4_address "$panel_domain"; then
+    echo "ERROR: Let's Encrypt certificates require a domain, not an IP address." >&2
+    exit 1
+  fi
+
+  if ! is_domain_name "$panel_domain"; then
+    echo "Invalid domain: $panel_domain" >&2
+    echo "Use a real domain like panel.example.com, without http:// or https://." >&2
+    exit 1
+  fi
+
+  printf '%s' "$panel_domain"
 }
 
 run_acme_step() {
@@ -133,22 +171,11 @@ install_acme_if_needed() {
 
 issue_panel_certificate() {
   local panel_host="$1"
-  local use_cert="${PANEL_CERT:-}"
   local acme_sh="$HOME/.acme.sh/acme.sh"
 
   if is_ipv4_address "$panel_host"; then
-    echo
-    echo "SSL certificate skipped: Let's Encrypt needs a domain, not an IP address."
-    return 0
-  fi
-
-  if [ -z "$use_cert" ]; then
-    echo
-    read -r -p "Issue Let's Encrypt certificate for $panel_host? Type yes to enable SSL cert option: " use_cert
-  fi
-
-  if [ "$use_cert" != "yes" ]; then
-    return 0
+    echo "ERROR: Let's Encrypt certificates require a domain, not an IP address." >&2
+    exit 1
   fi
 
   PANEL_CERT_ENABLED=1
@@ -180,6 +207,109 @@ issue_panel_certificate() {
   echo "Certificate installed:"
   echo "Key: $ACME_KEY_FILE"
   echo "Fullchain: $ACME_FULLCHAIN_FILE"
+}
+
+stop_nginx_for_acme() {
+  NGINX_WAS_ACTIVE=0
+
+  if need_command systemctl && $SUDO systemctl is-active --quiet nginx; then
+    NGINX_WAS_ACTIVE=1
+    echo
+    echo "Stopping nginx temporarily for standalone certificate issuance..."
+    $SUDO systemctl stop nginx
+  elif need_command service && $SUDO service nginx status >/dev/null 2>&1; then
+    NGINX_WAS_ACTIVE=1
+    echo
+    echo "Stopping nginx temporarily for standalone certificate issuance..."
+    $SUDO service nginx stop
+  fi
+}
+
+start_nginx_after_acme() {
+  if [ "$NGINX_WAS_ACTIVE" -eq 1 ]; then
+    echo
+    echo "Starting nginx again..."
+    if need_command systemctl; then
+      $SUDO systemctl start nginx || true
+    else
+      $SUDO service nginx start || true
+    fi
+  fi
+}
+
+write_install_info_value() {
+  local key="$1"
+  local value="$2"
+  local tmp_file
+
+  run_sudo mkdir -p "$INSTALL_INFO_DIR"
+  tmp_file="$(mktemp)"
+
+  if [ -f "$INSTALL_INFO_FILE" ]; then
+    if grep -q "^$key=" "$INSTALL_INFO_FILE"; then
+      grep -v "^$key=" "$INSTALL_INFO_FILE" > "$tmp_file"
+    else
+      cat "$INSTALL_INFO_FILE" > "$tmp_file"
+    fi
+  fi
+
+  printf '%s=%q\n' "$key" "$value" >> "$tmp_file"
+  run_sudo tee "$INSTALL_INFO_FILE" < "$tmp_file" >/dev/null
+  rm -f "$tmp_file"
+  run_sudo chmod 600 "$INSTALL_INFO_FILE"
+}
+
+configure_nginx_https() {
+  local panel_domain="$1"
+  local panel_port="${PANEL_PORT:-51821}"
+
+  run_sudo mkdir -p "$NGINX_AVAILABLE_DIR" "$NGINX_ENABLED_DIR"
+
+  run_sudo tee "$NGINX_SITE_FILE" >/dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $panel_domain;
+
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $panel_domain;
+
+    ssl_certificate $ACME_FULLCHAIN_FILE;
+    ssl_certificate_key $ACME_KEY_FILE;
+
+    location / {
+        proxy_pass http://127.0.0.1:$panel_port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+
+  run_sudo ln -sfn "$NGINX_SITE_FILE" "$NGINX_ENABLED_FILE"
+  run_acme_step "Testing nginx configuration" $SUDO nginx -t
+
+  if need_command systemctl; then
+    run_acme_step "Reloading nginx" sh -c "$SUDO systemctl reload nginx || $SUDO systemctl restart nginx"
+  else
+    run_acme_step "Reloading nginx" sh -c "$SUDO service nginx reload || $SUDO service nginx restart"
+  fi
+
+  write_install_info_value "PANEL_DOMAIN" "$panel_domain"
+  write_install_info_value "HTTPS_DOMAIN" "$panel_domain"
+  write_install_info_value "NGINX_SITE_FILE" "$NGINX_SITE_FILE"
+  write_install_info_value "NGINX_ENABLED_FILE" "$NGINX_ENABLED_FILE"
+  write_install_info_value "ACME_KEY_FILE" "$ACME_KEY_FILE"
+  write_install_info_value "ACME_FULLCHAIN_FILE" "$ACME_FULLCHAIN_FILE"
 }
 
 ensure_ssh_key() {
@@ -283,6 +413,8 @@ write_server_env() {
     printf 'PROJECT_DIR=%q\n' "$PROJECT_DIR"
     printf 'ACME_KEY_FILE=%q\n' "$ACME_KEY_FILE"
     printf 'ACME_FULLCHAIN_FILE=%q\n' "$ACME_FULLCHAIN_FILE"
+    printf 'NGINX_SITE_FILE=%q\n' "$NGINX_SITE_FILE"
+    printf 'NGINX_ENABLED_FILE=%q\n' "$NGINX_ENABLED_FILE"
   } | run_sudo tee "$INSTALL_INFO_FILE" >/dev/null
   run_sudo chmod 600 "$INSTALL_INFO_FILE"
 }
@@ -291,10 +423,13 @@ open_firewall_ports() {
   if need_command ufw; then
     $SUDO ufw allow "$WG_PORT/udp" || true
     $SUDO ufw allow "$PANEL_PORT/tcp" || true
-    if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
-      $SUDO ufw allow 80/tcp || true
-      $SUDO ufw allow 443/tcp || true
-    fi
+  fi
+}
+
+open_https_firewall_ports() {
+  if need_command ufw; then
+    $SUDO ufw allow 80/tcp || true
+    $SUDO ufw allow 443/tcp || true
   fi
 }
 
@@ -338,7 +473,6 @@ install_panel() {
   ensure_docker
   clone_or_update_repo
   server_host="$(choose_panel_host "$(detect_server_ip)")"
-  issue_panel_certificate "$server_host"
   write_server_env "$server_host"
   open_firewall_ports
   start_stack
@@ -349,29 +483,38 @@ install_panel() {
   echo
   echo "Panel installed and starting:"
   echo "http://$WG_HOST:$PANEL_PORT"
-  if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
-    echo
-    echo "SSL certificate was issued for: $WG_HOST"
-    echo "Use these files in your HTTPS reverse proxy:"
-    echo "Key: $ACME_KEY_FILE"
-    echo "Fullchain: $ACME_FULLCHAIN_FILE"
-  fi
   echo
   echo "WireGuard UDP port: $WG_PORT"
   echo "Project directory: $PROJECT_DIR"
 }
 
 receive_certificate() {
-  local server_host
+  local panel_domain
 
-  install_base_packages
-  load_install_info
-  server_host="$(choose_panel_host "${WG_HOST:-$(detect_server_ip)}")"
-  issue_panel_certificate "$server_host"
-  open_firewall_ports
+  install_ssl_packages
+  load_install_info || true
+  PANEL_PORT="${PANEL_PORT:-51821}"
+  panel_domain="$(choose_certificate_domain)"
+
+  stop_nginx_for_acme
+  trap 'start_nginx_after_acme' EXIT
+  issue_panel_certificate "$panel_domain"
+  start_nginx_after_acme
+  trap - EXIT
+
+  open_https_firewall_ports
+  configure_nginx_https "$panel_domain"
 
   echo
-  echo "Certificate option finished."
+  echo "HTTPS is ready:"
+  echo "https://$panel_domain"
+  echo
+  echo "Panel backend:"
+  echo "http://127.0.0.1:$PANEL_PORT"
+  echo
+  echo "Certificate files:"
+  echo "$ACME_KEY_FILE"
+  echo "$ACME_FULLCHAIN_FILE"
 }
 
 show_panel_info() {
@@ -396,7 +539,13 @@ show_panel_info() {
   echo
   echo "Panel Information"
   echo "================="
-  echo "Address: http://${WG_HOST:-unknown}:${PANEL_PORT:-51821}"
+  echo "HTTP backend: http://${WG_HOST:-unknown}:${PANEL_PORT:-51821}"
+  if [ -n "${HTTPS_DOMAIN:-}" ] && [ -n "${NGINX_SITE_FILE:-}" ] && [ -f "$NGINX_SITE_FILE" ] && [ -f "${ACME_KEY_FILE:-}" ] && [ -f "${ACME_FULLCHAIN_FILE:-}" ]; then
+    echo "HTTPS: https://$HTTPS_DOMAIN"
+  else
+    echo "HTTPS: not configured"
+    echo "HTTPS note: Run option 2 after DNS points to this server."
+  fi
   echo "Domain/IP: ${WG_HOST:-unknown}"
   echo "Panel port: ${PANEL_PORT:-51821}"
   echo "WireGuard UDP port: ${WG_PUBLISHED_PORT:-${WG_PORT:-51820}}"
@@ -404,6 +553,16 @@ show_panel_info() {
   echo "Install info file: $INSTALL_INFO_FILE"
   echo "Certificate key: ${ACME_KEY_FILE:-not set}"
   echo "Certificate fullchain: ${ACME_FULLCHAIN_FILE:-not set}"
+  echo "Nginx site: ${NGINX_SITE_FILE:-not set}"
+  echo
+  echo "Nginx:"
+  if need_command systemctl; then
+    $SUDO systemctl is-active nginx 2>/dev/null || true
+  elif need_command service; then
+    $SUDO service nginx status 2>/dev/null || true
+  else
+    echo "Nginx service manager was not found."
+  fi
   echo
   echo "Containers:"
   if need_command docker; then
@@ -434,7 +593,7 @@ remove_panel() {
     return 0
   fi
 
-  load_install_info
+  load_install_info || true
 
   if need_command docker; then
     if [ -d "${PROJECT_DIR:-}/" ] && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
@@ -448,6 +607,28 @@ remove_panel() {
 
   if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
     run_sudo rm -rf "$PROJECT_DIR"
+  fi
+
+  if [ -n "${NGINX_ENABLED_FILE:-}" ] && [ -e "$NGINX_ENABLED_FILE" ]; then
+    run_sudo rm -f "$NGINX_ENABLED_FILE"
+  fi
+
+  if [ -n "${NGINX_SITE_FILE:-}" ] && [ -f "$NGINX_SITE_FILE" ]; then
+    run_sudo rm -f "$NGINX_SITE_FILE"
+  fi
+
+  if [ -d "$(dirname "$ACME_KEY_FILE")" ]; then
+    run_sudo rm -rf "$(dirname "$ACME_KEY_FILE")"
+  fi
+
+  if need_command nginx; then
+    $SUDO nginx -t >/dev/null 2>&1 && {
+      if need_command systemctl; then
+        $SUDO systemctl reload nginx 2>/dev/null || true
+      else
+        $SUDO service nginx reload 2>/dev/null || true
+      fi
+    }
   fi
 
   if [ -f "$INSTALL_INFO_FILE" ]; then
