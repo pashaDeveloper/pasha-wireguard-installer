@@ -9,6 +9,14 @@ PANEL_PORT_END="${PANEL_PORT_END:-$((PANEL_PORT + 100))}"
 WG_PORT="${WG_PORT:-51820}"
 LANG_VALUE="${LANG_VALUE:-fa}"
 PASSWORD_HASH="${PASSWORD_HASH:-\$2a\$12\$1TMRGxEHRqYIgDMhEj1Txe9HOv7FwRY0I5s5YU.v.wziEMwZ2kK8i}"
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
+ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
+ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
+INSTALL_INFO_DIR="${INSTALL_INFO_DIR:-/etc/pasha-panel}"
+INSTALL_INFO_FILE="${INSTALL_INFO_FILE:-$INSTALL_INFO_DIR/install.env}"
+REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
+PANEL_CERT_ENABLED=0
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -20,27 +28,20 @@ need_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
-is_yes() {
-  local answer="${1//$'\r'/}"
-
-  case "$answer" in
-    yes|YES|Yes|y|Y)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+run_sudo() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
 }
 
-flush_pending_input() {
-  local char
+is_ipv4_address() {
+  printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
 
-  while IFS= read -r -s -n 1 -t 0.05 char; do
-    if [ "$char" = $'\n' ] || [ "$char" = $'\r' ]; then
-      break
-    fi
-  done
+is_domain_name() {
+  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
 }
 
 detect_server_ip() {
@@ -67,8 +68,114 @@ install_base_packages() {
   fi
 
   $SUDO apt-get update
-  $SUDO apt-get upgrade -y
-  $SUDO apt-get install -y ca-certificates curl git openssh-client openssl
+  $SUDO apt-get install -y ca-certificates curl git openssh-client openssl socat
+}
+
+load_install_info() {
+  if [ -f "$INSTALL_INFO_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$INSTALL_INFO_FILE"
+  elif [ -f "$PROJECT_DIR/.env" ]; then
+    # shellcheck disable=SC1090
+    . "$PROJECT_DIR/.env"
+  fi
+}
+
+choose_panel_host() {
+  local detected_host="$1"
+  local panel_domain="$PANEL_DOMAIN"
+
+  echo >&2
+  if [ -z "$panel_domain" ]; then
+    read -r -p "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host): " panel_domain
+  fi
+
+  if [ -n "$panel_domain" ]; then
+    if ! is_domain_name "$panel_domain"; then
+      echo "Invalid domain: $panel_domain" >&2
+      echo "Use a real domain like panel.example.com, without http:// or https://." >&2
+      exit 1
+    fi
+    printf '%s' "$panel_domain"
+  else
+    printf '%s' "$detected_host"
+  fi
+}
+
+run_acme_step() {
+  local description="$1"
+  shift
+
+  echo
+  echo "$description"
+  if ! "$@"; then
+    echo
+    echo "ERROR: $description failed." >&2
+    echo "Check that the domain DNS A record points to this server and that TCP port 80 is open." >&2
+    exit 1
+  fi
+}
+
+install_acme_if_needed() {
+  if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
+    run_acme_step "Installing acme.sh" sh -c "curl -fsSL https://get.acme.sh | sh"
+  fi
+
+  if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
+    echo "ERROR: acme.sh was not installed at $HOME/.acme.sh/acme.sh" >&2
+    exit 1
+  fi
+}
+
+issue_panel_certificate() {
+  local panel_host="$1"
+  local use_cert="${PANEL_CERT:-}"
+  local acme_sh="$HOME/.acme.sh/acme.sh"
+
+  if is_ipv4_address "$panel_host"; then
+    echo
+    echo "SSL certificate skipped: Let's Encrypt needs a domain, not an IP address."
+    return 0
+  fi
+
+  if [ -z "$use_cert" ]; then
+    echo
+    read -r -p "Issue Let's Encrypt certificate for $panel_host? Type yes to enable SSL cert option: " use_cert
+  fi
+
+  if [ "$use_cert" != "yes" ]; then
+    return 0
+  fi
+
+  PANEL_CERT_ENABLED=1
+
+  if [ -z "$ACME_EMAIL" ]; then
+    read -r -p "Enter email for Let's Encrypt account: " ACME_EMAIL
+  fi
+
+  if [ -z "$ACME_EMAIL" ]; then
+    echo "ERROR: ACME_EMAIL is required for certificate registration." >&2
+    exit 1
+  fi
+
+  install_acme_if_needed
+
+  run_acme_step "Setting default CA to Let's Encrypt" "$acme_sh" --set-default-ca --server letsencrypt
+  run_acme_step "Registering Let's Encrypt account" "$acme_sh" --register-account -m "$ACME_EMAIL"
+  run_acme_step "Issuing certificate for $panel_host" "$acme_sh" --issue -d "$panel_host" --standalone
+
+  $SUDO mkdir -p "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
+  $SUDO chown "$(id -u):$(id -g)" "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
+  run_acme_step "Installing certificate files" "$acme_sh" --install-cert -d "$panel_host" \
+    --key-file "$ACME_KEY_FILE" \
+    --fullchain-file "$ACME_FULLCHAIN_FILE"
+  $SUDO chmod 600 "$ACME_KEY_FILE"
+  $SUDO chmod 644 "$ACME_FULLCHAIN_FILE"
+
+  echo
+  echo "Certificate installed:"
+  echo "Key: $ACME_KEY_FILE"
+  echo "Fullchain: $ACME_FULLCHAIN_FILE"
 }
 
 ensure_ssh_key() {
@@ -160,212 +267,214 @@ write_server_env() {
   } > "$PROJECT_DIR/.env"
 
   chmod 600 "$PROJECT_DIR/.env"
+
+  run_sudo mkdir -p "$INSTALL_INFO_DIR"
+  {
+    printf 'WG_HOST=%q\n' "$server_host"
+    printf 'PANEL_PORT=%q\n' "$PANEL_PORT"
+    printf 'PANEL_PORT_START=%q\n' "$PANEL_PORT"
+    printf 'PANEL_PORT_END=%q\n' "$PANEL_PORT_END"
+    printf 'WG_PUBLISHED_PORT=%q\n' "$WG_PORT"
+    printf 'WG_CONFIG_PORT=%q\n' "$WG_PORT"
+    printf 'PROJECT_DIR=%q\n' "$PROJECT_DIR"
+    printf 'ACME_KEY_FILE=%q\n' "$ACME_KEY_FILE"
+    printf 'ACME_FULLCHAIN_FILE=%q\n' "$ACME_FULLCHAIN_FILE"
+  } | run_sudo tee "$INSTALL_INFO_FILE" >/dev/null
+  run_sudo chmod 600 "$INSTALL_INFO_FILE"
 }
 
 open_firewall_ports() {
   if need_command ufw; then
     $SUDO ufw allow "$WG_PORT/udp" || true
     $SUDO ufw allow "$PANEL_PORT/tcp" || true
+    if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
+      $SUDO ufw allow 80/tcp || true
+      $SUDO ufw allow 443/tcp || true
+    fi
   fi
 }
 
 start_stack() {
-  cd "$PROJECT_DIR"
-  $SUDO docker compose --env-file .env up -d --build
+  (cd "$PROJECT_DIR" && $SUDO docker compose --env-file .env up -d --build)
 }
 
-env_value() {
-  local key="$1"
-  local env_file="$PROJECT_DIR/.env"
+cleanup_project_dir_after_install() {
+  local project_real=""
+  local cwd_real=""
 
-  if [ ! -f "$env_file" ]; then
+  if [ "$REMOVE_PROJECT_AFTER_INSTALL" != "yes" ]; then
     return 0
   fi
 
-  grep "^${key}=" "$env_file" 2>/dev/null | tail -n 1 | cut -d= -f2- || true
-}
-
-show_admin_users() {
-  if [ ! -d "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/docker-compose.yml" ]; then
-    echo "Admin list: panel project was not found."
-    return
+  if [ ! -d "$PROJECT_DIR" ]; then
+    return 0
   fi
 
-  if ! need_command docker; then
-    echo "Admin list: Docker is not installed."
-    return
-  fi
+  project_real="$(cd "$PROJECT_DIR" && pwd -P)"
+  cwd_real="$(pwd -P)"
 
-  cd "$PROJECT_DIR"
-
-  if ! $SUDO docker compose ps mysql >/dev/null 2>&1; then
-    echo "Admin list: MySQL container is not available."
-    return
-  fi
-
-  if ! $SUDO docker compose exec -T mysql mysql \
-    -u wg_easy \
-    -pwg_easy_password \
-    wg_easy \
-    -e "SELECT username, role, COALESCE(password_plaintext, '') AS password, created_at FROM admin_users ORDER BY role DESC, username;" 2>/dev/null; then
-    echo "Admin list: could not read admin_users table. The panel may not be initialized yet."
-  fi
-}
-
-show_panel_info() {
-  local server_host panel_port wg_port panel_url password_hash
-
-  server_host="$(env_value WG_HOST)"
-  panel_port="$(env_value PANEL_PORT)"
-  wg_port="$(env_value WG_PUBLISHED_PORT)"
-  password_hash="$(env_value PASSWORD_HASH)"
-
-  if [ -z "$server_host" ]; then
-    server_host="$(detect_server_ip)"
-  fi
-  panel_port="${panel_port:-$PANEL_PORT}"
-  wg_port="${wg_port:-$WG_PORT}"
-
-  if [ -n "$server_host" ]; then
-    panel_url="http://$server_host:$panel_port"
-  else
-    panel_url="Unknown. WG_HOST was not detected and .env was not found."
+  if [ "$project_real" = "$cwd_real" ]; then
+    echo
+    echo "Project directory was not removed because the installer is running from it:"
+    echo "$project_real"
+    return 0
   fi
 
   echo
-  echo "Panel information"
-  echo "-----------------"
-  echo "Panel URL: $panel_url"
-  echo "Project directory: $PROJECT_DIR"
-  echo "Panel TCP port: $panel_port"
-  echo "WireGuard UDP port: $wg_port"
-  if [ -n "$password_hash" ]; then
-    echo "Password hash: $password_hash"
-    echo "Plain password: cannot be recovered from PASSWORD_HASH."
-  else
-    echo "Password hash: not found in $PROJECT_DIR/.env"
-  fi
-  echo
-  show_admin_users
-}
-
-uninstall_panel() {
-  local confirmed remove_data remove_project
-
-  echo
-  echo "This will stop and remove the panel containers for:"
-  echo "$PROJECT_DIR"
-  read -r -p "Type yes to continue: " confirmed
-  if ! is_yes "$confirmed"; then
-    echo "Canceled."
-    return
-  fi
-
-  if [ -d "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
-    cd "$PROJECT_DIR"
-    local compose_env_args=()
-    if [ -f ".env" ]; then
-      compose_env_args=(--env-file .env)
-    fi
-
-    read -r -p "Also remove Docker volumes and saved panel/WireGuard data? Type yes to remove data: " remove_data
-    if is_yes "$remove_data"; then
-      $SUDO docker compose "${compose_env_args[@]}" down -v --remove-orphans
-    else
-      $SUDO docker compose "${compose_env_args[@]}" down --remove-orphans
-    fi
-  else
-    echo "Project directory or docker-compose.yml was not found."
-  fi
-
-  read -r -p "Remove project directory from disk too? Type yes to remove files: " remove_project
-  if is_yes "$remove_project"; then
-    case "$PROJECT_DIR" in
-      ""|"/"|"$HOME"|"$HOME/")
-        echo "Refusing to remove unsafe PROJECT_DIR: $PROJECT_DIR"
-        ;;
-      *)
-        if [ -f "$PROJECT_DIR/docker-compose.yml" ] || [ -d "$PROJECT_DIR/.git" ]; then
-          rm -rf -- "$PROJECT_DIR"
-          echo "Project directory removed."
-        else
-          echo "Refusing to remove PROJECT_DIR because it does not look like this panel project."
-        fi
-        ;;
-    esac
-  fi
-
-  echo "Panel removal finished."
+  echo "Removing downloaded project directory:"
+  echo "$project_real"
+  run_sudo rm -rf "$project_real"
 }
 
 install_panel() {
+  local server_host
+
   install_base_packages
   ensure_ssh_key
   ensure_docker
   clone_or_update_repo
-  write_server_env "$(detect_server_ip)"
+  server_host="$(choose_panel_host "$(detect_server_ip)")"
+  issue_panel_certificate "$server_host"
+  write_server_env "$server_host"
   open_firewall_ports
   start_stack
+  cleanup_project_dir_after_install
 
-  local server_host
-  server_host="$(grep '^WG_HOST=' "$PROJECT_DIR/.env" | cut -d= -f2-)"
+  load_install_info
 
   echo
-  echo "Panel is starting:"
-  echo "http://$server_host:$PANEL_PORT"
+  echo "Panel installed and starting:"
+  echo "http://$WG_HOST:$PANEL_PORT"
+  if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
+    echo
+    echo "SSL certificate was issued for: $WG_HOST"
+    echo "Use these files in your HTTPS reverse proxy:"
+    echo "Key: $ACME_KEY_FILE"
+    echo "Fullchain: $ACME_FULLCHAIN_FILE"
+  fi
   echo
   echo "WireGuard UDP port: $WG_PORT"
   echo "Project directory: $PROJECT_DIR"
 }
 
-show_menu() {
+receive_certificate() {
+  local server_host
+
+  install_base_packages
+  load_install_info
+  server_host="$(choose_panel_host "${WG_HOST:-$(detect_server_ip)}")"
+  issue_panel_certificate "$server_host"
+  open_firewall_ports
+
   echo
-  echo "Pasha Forever WireGuard"
-  echo "-----------------------"
-  echo "1) Install panel"
-  echo "2) Panel information"
-  echo "3) Uninstall panel"
-  echo "4) Exit"
-  echo
+  echo "Certificate option finished."
 }
 
-pause_for_menu() {
+show_panel_info() {
+  load_install_info
+
   echo
-  read -r -p "Press Enter to return to the main menu..."
+  echo "Panel Information"
+  echo "================="
+  echo "Address: http://${WG_HOST:-unknown}:${PANEL_PORT:-51821}"
+  echo "Domain/IP: ${WG_HOST:-unknown}"
+  echo "Panel port: ${PANEL_PORT:-51821}"
+  echo "WireGuard UDP port: ${WG_PUBLISHED_PORT:-${WG_PORT:-51820}}"
+  echo "Project directory: ${PROJECT_DIR:-unknown}"
+  echo "Install info file: $INSTALL_INFO_FILE"
+  echo "Certificate key: ${ACME_KEY_FILE:-not set}"
+  echo "Certificate fullchain: ${ACME_FULLCHAIN_FILE:-not set}"
+  echo
+  echo "Containers:"
+  if need_command docker; then
+    $SUDO docker ps -a --filter "name=wg-easy-m3" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+  else
+    echo "Docker is not installed."
+  fi
+
+  echo
+  echo "Panel admins:"
+  if need_command docker && $SUDO docker ps --format '{{.Names}}' | grep -qx 'wg-easy-m3-mysql'; then
+    $SUDO docker exec wg-easy-m3-mysql mysql -uwg_easy -pwg_easy_password wg_easy \
+      -e "SELECT role, username, COALESCE(password_plaintext, '') AS password FROM admin_users ORDER BY role DESC, created_at ASC;" 2>/dev/null || \
+      echo "Could not read admin users from MySQL."
+  else
+    echo "MySQL container is not running."
+  fi
+}
+
+remove_panel() {
+  local confirmed
+
+  echo
+  echo "This will remove the panel containers, database volume, WireGuard volume, image, install info, and project directory."
+  read -r -p "Type DELETE to remove the panel: " confirmed
+  if [ "$confirmed" != "DELETE" ]; then
+    echo "Remove cancelled."
+    return 0
+  fi
+
+  load_install_info
+
+  if need_command docker; then
+    if [ -d "${PROJECT_DIR:-}/" ] && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+      (cd "$PROJECT_DIR" && $SUDO docker compose down -v --remove-orphans) || true
+    fi
+
+    $SUDO docker rm -f wg-easy-m3 wg-easy-m3-mysql 2>/dev/null || true
+    $SUDO docker volume ls --format '{{.Name}}' | grep -E '(^|_)etc_wireguard$|(^|_)mysql_data$' | xargs -r $SUDO docker volume rm 2>/dev/null || true
+    $SUDO docker image rm wg-easy-m3:local 2>/dev/null || true
+  fi
+
+  if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+    run_sudo rm -rf "$PROJECT_DIR"
+  fi
+
+  if [ -f "$INSTALL_INFO_FILE" ]; then
+    run_sudo rm -f "$INSTALL_INFO_FILE"
+  fi
+
+  echo "Panel removed."
+}
+
+print_menu() {
+  echo
+  echo "Pasha WireGuard Panel Installer"
+  echo "=============================="
+  echo "1) Install panel"
+  echo "2) Receive SSL certificate"
+  echo "3) Panel information"
+  echo "4) Remove panel"
+  echo
 }
 
 main() {
-  local choice
+  local choice="${1:-}"
 
-  while true; do
-    show_menu
-    read -r -s -n 1 -p "Press a number: " choice
-    echo
-    flush_pending_input
+  if [ -z "$choice" ]; then
+    print_menu
+    read -r -p "Select an option [1-4]: " choice
+  fi
 
-    case "$choice" in
-      1)
-        install_panel
-        pause_for_menu
-        ;;
-      2)
-        show_panel_info
-        pause_for_menu
-        ;;
-      3)
-        uninstall_panel
-        pause_for_menu
-        ;;
-      4|0|q|Q)
-        echo "Bye."
-        exit 0
-        ;;
-      *)
-        echo "Invalid option."
-        pause_for_menu
-        ;;
-    esac
-  done
+  case "$choice" in
+    1|install)
+      install_panel
+      ;;
+    2|cert|certificate)
+      receive_certificate
+      ;;
+    3|info)
+      show_panel_info
+      ;;
+    4|remove|delete|uninstall)
+      remove_panel
+      ;;
+    *)
+      echo "Invalid option: $choice" >&2
+      print_menu
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
