@@ -75,10 +75,14 @@ load_install_info() {
   if [ -f "$INSTALL_INFO_FILE" ]; then
     # shellcheck disable=SC1090
     . "$INSTALL_INFO_FILE"
+    return 0
   elif [ -f "$PROJECT_DIR/.env" ]; then
     # shellcheck disable=SC1090
     . "$PROJECT_DIR/.env"
+    return 0
   fi
+
+  return 1
 }
 
 choose_panel_host() {
@@ -371,7 +375,23 @@ receive_certificate() {
 }
 
 show_panel_info() {
-  load_install_info
+  local has_install_info=0
+  local has_containers=0
+
+  if load_install_info; then
+    has_install_info=1
+  fi
+
+  if need_command docker && $SUDO docker ps -a --format '{{.Names}}' | grep -qxE 'wg-easy-m3|wg-easy-m3-mysql'; then
+    has_containers=1
+  fi
+
+  if [ "$has_install_info" -eq 0 ] && [ "$has_containers" -eq 0 ]; then
+    echo
+    echo "Panel is not installed."
+    echo "No install info file or panel containers were found."
+    return 0
+  fi
 
   echo
   echo "Panel Information"
@@ -432,6 +452,10 @@ remove_panel() {
 
   if [ -f "$INSTALL_INFO_FILE" ]; then
     run_sudo rm -f "$INSTALL_INFO_FILE"
+  fi
+
+  if [ -d "$INSTALL_INFO_DIR" ]; then
+    run_sudo rmdir "$INSTALL_INFO_DIR" 2>/dev/null || true
   fi
 
   echo "Panel removed."
