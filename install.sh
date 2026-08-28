@@ -158,6 +158,29 @@ run_acme_step() {
   fi
 }
 
+run_acme_issue_step() {
+  local panel_host="$1"
+  local acme_sh="$2"
+
+  echo
+  echo "Issuing certificate for $panel_host"
+  if "$acme_sh" --issue -d "$panel_host" --standalone; then
+    return 0
+  fi
+
+  if "$acme_sh" --list | grep -qE "(^|[[:space:]])${panel_host}([[:space:]]|$)"; then
+    echo
+    echo "Certificate for $panel_host already exists and is not due for renewal."
+    echo "Continuing with certificate file installation."
+    return 0
+  fi
+
+  echo
+  echo "ERROR: Issuing certificate for $panel_host failed." >&2
+  echo "Check that the domain DNS A record points to this server and that TCP port 80 is open." >&2
+  exit 1
+}
+
 install_acme_if_needed() {
   if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
     run_acme_step "Installing acme.sh" sh -c "curl -fsSL https://get.acme.sh | sh"
@@ -193,7 +216,7 @@ issue_panel_certificate() {
 
   run_acme_step "Setting default CA to Let's Encrypt" "$acme_sh" --set-default-ca --server letsencrypt
   run_acme_step "Registering Let's Encrypt account" "$acme_sh" --register-account -m "$ACME_EMAIL"
-  run_acme_step "Issuing certificate for $panel_host" "$acme_sh" --issue -d "$panel_host" --standalone
+  run_acme_issue_step "$panel_host" "$acme_sh"
 
   $SUDO mkdir -p "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
   $SUDO chown "$(id -u):$(id -g)" "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
