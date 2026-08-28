@@ -17,6 +17,7 @@ ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
 ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
 ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
 PANEL_CERT_ENABLED=0
+NGINX_WAS_ACTIVE=0
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -26,6 +27,14 @@ fi
 
 need_command() {
   command -v "$1" >/dev/null 2>&1
+}
+
+run_sudo() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
 }
 
 is_ipv4_address() {
@@ -63,6 +72,11 @@ install_base_packages() {
   $SUDO apt-get install -y ca-certificates curl git openssh-client openssl socat
 }
 
+install_ssl_packages() {
+  install_base_packages
+  $SUDO apt-get install -y nginx
+}
+
 choose_panel_host() {
   local detected_host="$1"
   local panel_domain="$PANEL_DOMAIN"
@@ -82,6 +96,33 @@ choose_panel_host() {
   else
     printf '%s' "$detected_host"
   fi
+}
+
+choose_certificate_domain() {
+  local panel_domain="$PANEL_DOMAIN"
+
+  echo >&2
+  if [ -z "$panel_domain" ]; then
+    read -r -p "Enter panel domain for SSL (example: panel.example.com): " panel_domain
+  fi
+
+  if [ -z "$panel_domain" ]; then
+    echo "ERROR: Domain is required for SSL certificate." >&2
+    exit 1
+  fi
+
+  if is_ipv4_address "$panel_domain"; then
+    echo "ERROR: Let's Encrypt certificates require a domain, not an IP address." >&2
+    exit 1
+  fi
+
+  if ! is_domain_name "$panel_domain"; then
+    echo "Invalid domain: $panel_domain" >&2
+    echo "Use a real domain like panel.example.com, without http:// or https://." >&2
+    exit 1
+  fi
+
+  printf '%s' "$panel_domain"
 }
 
 run_acme_step() {
@@ -181,6 +222,34 @@ issue_panel_certificate() {
   echo "Certificate installed:"
   echo "Key: $ACME_KEY_FILE"
   echo "Fullchain: $ACME_FULLCHAIN_FILE"
+}
+
+stop_nginx_for_acme() {
+  NGINX_WAS_ACTIVE=0
+
+  if need_command systemctl && $SUDO systemctl is-active --quiet nginx; then
+    NGINX_WAS_ACTIVE=1
+    echo
+    echo "Stopping nginx temporarily for standalone certificate issuance..."
+    $SUDO systemctl stop nginx
+  elif need_command service && $SUDO service nginx status >/dev/null 2>&1; then
+    NGINX_WAS_ACTIVE=1
+    echo
+    echo "Stopping nginx temporarily for standalone certificate issuance..."
+    $SUDO service nginx stop
+  fi
+}
+
+start_nginx_after_acme() {
+  if [ "$NGINX_WAS_ACTIVE" -eq 1 ]; then
+    echo
+    echo "Starting nginx again..."
+    if need_command systemctl; then
+      $SUDO systemctl start nginx
+    else
+      $SUDO service nginx start
+    fi
+  fi
 }
 
 ensure_deploy_key() {
@@ -290,7 +359,7 @@ start_stack() {
   $SUDO docker compose --env-file .env up -d --build
 }
 
-main() {
+install_panel() {
   local server_host
 
   install_base_packages
@@ -318,6 +387,118 @@ main() {
   echo
   echo "WireGuard UDP port: $WG_PORT"
   echo "Private project directory: $PROJECT_DIR"
+}
+
+receive_certificate() {
+  local panel_domain
+
+  install_ssl_packages
+  panel_domain="$(choose_certificate_domain)"
+
+  stop_nginx_for_acme
+  trap 'start_nginx_after_acme' EXIT
+  PANEL_CERT=yes issue_panel_certificate "$panel_domain"
+  start_nginx_after_acme
+  trap - EXIT
+
+  if need_command ufw; then
+    $SUDO ufw allow 80/tcp || true
+    $SUDO ufw allow 443/tcp || true
+  fi
+
+  echo
+  echo "Certificate files are ready:"
+  echo "Key: $ACME_KEY_FILE"
+  echo "Fullchain: $ACME_FULLCHAIN_FILE"
+}
+
+show_panel_info() {
+  echo
+  echo "Panel information"
+  echo "Project directory: $PROJECT_DIR"
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    # shellcheck disable=SC1090
+    . "$PROJECT_DIR/.env"
+    echo "Domain/IP: ${WG_HOST:-unknown}"
+    echo "Panel port: ${PANEL_PORT:-51821}"
+    echo "WireGuard UDP port: ${WG_PUBLISHED_PORT:-${WG_PORT:-51820}}"
+  else
+    echo "No .env file found at $PROJECT_DIR/.env"
+  fi
+
+  if need_command docker; then
+    echo
+    echo "Containers:"
+    $SUDO docker ps -a --filter "name=wg-easy-m3" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+  fi
+}
+
+remove_panel() {
+  local confirmed
+
+  echo
+  echo "This will remove panel containers, volumes, image, and project directory."
+  read -r -p "Type DELETE to remove the panel: " confirmed
+  if [ "$confirmed" != "DELETE" ]; then
+    echo "Remove cancelled."
+    return 0
+  fi
+
+  if need_command docker; then
+    if [ -d "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+      (cd "$PROJECT_DIR" && $SUDO docker compose down -v --remove-orphans) || true
+    fi
+
+    $SUDO docker rm -f wg-easy-m3 wg-easy-m3-mysql 2>/dev/null || true
+    $SUDO docker volume ls --format '{{.Name}}' | grep -E '(^|_)etc_wireguard$|(^|_)mysql_data$' | xargs -r $SUDO docker volume rm 2>/dev/null || true
+    $SUDO docker image rm wg-easy-m3:local 2>/dev/null || true
+  fi
+
+  if [ -d "$PROJECT_DIR" ]; then
+    run_sudo rm -rf "$PROJECT_DIR"
+  fi
+
+  echo "Panel removed."
+}
+
+print_menu() {
+  echo
+  echo "Pasha WireGuard Panel Installer"
+  echo "=============================="
+  echo "1) Install panel"
+  echo "2) Receive SSL certificate"
+  echo "3) Panel information"
+  echo "4) Remove panel"
+  echo
+}
+
+main() {
+  local choice="${1:-}"
+
+  if [ -z "$choice" ]; then
+    print_menu
+    read -r -p "Select an option [1-4]: " choice
+  fi
+
+  case "$choice" in
+    1|install)
+      install_panel
+      ;;
+    2|cert|certificate)
+      receive_certificate
+      ;;
+    3|info)
+      show_panel_info
+      ;;
+    4|remove|delete|uninstall)
+      remove_panel
+      ;;
+    *)
+      echo "Invalid option: $choice" >&2
+      print_menu
+      exit 1
+      ;;
+  esac
 }
 
 main "$@"
