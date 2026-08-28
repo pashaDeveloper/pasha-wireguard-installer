@@ -24,6 +24,8 @@ NGINX_SITE_FILE="${NGINX_SITE_FILE:-$NGINX_AVAILABLE_DIR/$NGINX_SITE_NAME.conf}"
 NGINX_ENABLED_FILE="${NGINX_ENABLED_FILE:-$NGINX_ENABLED_DIR/$NGINX_SITE_NAME.conf}"
 PANEL_CERT_ENABLED=0
 NGINX_WAS_ACTIVE=0
+CHOSEN_PANEL_HOST=""
+CHOSEN_CERTIFICATE_DOMAIN=""
 RED=$'\033[31m'
 BOLD=$'\033[1m'
 RESET=$'\033[0m'
@@ -119,9 +121,9 @@ choose_panel_host() {
       echo "Use a real domain like panel.example.com, without http:// or https://." >&2
       exit 1
     fi
-    printf '%s' "$panel_domain"
+    CHOSEN_PANEL_HOST="$panel_domain"
   else
-    printf '%s' "$detected_host"
+    CHOSEN_PANEL_HOST="$detected_host"
   fi
 }
 
@@ -149,7 +151,7 @@ choose_certificate_domain() {
     exit 1
   fi
 
-  printf '%s' "$panel_domain"
+  CHOSEN_CERTIFICATE_DOMAIN="$panel_domain"
 }
 
 run_acme_step() {
@@ -485,7 +487,8 @@ install_panel() {
   ensure_deploy_key
   ensure_docker
   clone_or_update_private_repo
-  server_host="$(choose_panel_host "$(detect_server_ip)")"
+  choose_panel_host "$(detect_server_ip)"
+  server_host="$CHOSEN_PANEL_HOST"
   issue_panel_certificate "$server_host"
   write_server_env "$server_host"
   open_firewall_ports
@@ -519,7 +522,8 @@ receive_certificate() {
   local panel_domain
 
   install_ssl_packages
-  panel_domain="$(choose_certificate_domain)"
+  choose_certificate_domain
+  panel_domain="$CHOSEN_CERTIFICATE_DOMAIN"
 
   stop_nginx_for_acme
   trap 'start_nginx_after_acme' EXIT
