@@ -18,6 +18,9 @@ ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
 ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
 PANEL_CERT_ENABLED=0
 NGINX_WAS_ACTIVE=0
+RED=$'\033[31m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
 
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -268,7 +271,9 @@ ensure_deploy_key() {
   echo "GitHub repo > Settings > Deploy keys > Add deploy key"
   echo "Write access: OFF"
   echo
+  printf '%s%s' "$BOLD" "$RED"
   cat "$DEPLOY_KEY_PATH.pub"
+  printf '%s' "$RESET"
   echo
 
   read -r -p "After adding the deploy key, type yes to continue: " confirmed
@@ -437,8 +442,10 @@ remove_panel() {
   local confirmed
 
   echo
-  echo "This will remove panel containers, volumes, image, and project directory."
-  read -r -p "Type DELETE to remove the panel: " confirmed
+  printf '%s%s%s\n' "$RED" "DANGER: This will remove panel containers, volumes, image, and project directory." "$RESET"
+  printf '%s%s%s\n' "$RED" "Type DELETE to remove the panel." "$RESET"
+  printf '> '
+  read -r confirmed
   if [ "$confirmed" != "DELETE" ]; then
     echo "Remove cancelled."
     return 0
@@ -468,7 +475,7 @@ print_menu() {
   echo "1) Install panel"
   echo "2) Receive SSL certificate"
   echo "3) Panel information"
-  echo "4) Remove panel"
+  printf '%s4) Remove panel%s\n' "$RED" "$RESET"
   echo
 }
 
