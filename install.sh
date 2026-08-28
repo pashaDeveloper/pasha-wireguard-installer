@@ -17,6 +17,11 @@ ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
 ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
 ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
 REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
+NGINX_SITE_NAME="${NGINX_SITE_NAME:-pasha-panel}"
+NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+NGINX_ENABLED_DIR="${NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+NGINX_SITE_FILE="${NGINX_SITE_FILE:-$NGINX_AVAILABLE_DIR/$NGINX_SITE_NAME.conf}"
+NGINX_ENABLED_FILE="${NGINX_ENABLED_FILE:-$NGINX_ENABLED_DIR/$NGINX_SITE_NAME.conf}"
 PANEL_CERT_ENABLED=0
 NGINX_WAS_ACTIVE=0
 RED=$'\033[31m'
@@ -256,6 +261,52 @@ start_nginx_after_acme() {
   fi
 }
 
+configure_nginx_https() {
+  local panel_domain="$1"
+  local panel_port="${PANEL_PORT:-51821}"
+
+  run_sudo mkdir -p "$NGINX_AVAILABLE_DIR" "$NGINX_ENABLED_DIR"
+
+  run_sudo tee "$NGINX_SITE_FILE" >/dev/null <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $panel_domain;
+
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $panel_domain;
+
+    ssl_certificate $ACME_FULLCHAIN_FILE;
+    ssl_certificate_key $ACME_KEY_FILE;
+
+    location / {
+        proxy_pass http://127.0.0.1:$panel_port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+
+  run_sudo ln -sfn "$NGINX_SITE_FILE" "$NGINX_ENABLED_FILE"
+  run_acme_step "Testing nginx configuration" $SUDO nginx -t
+
+  if need_command systemctl; then
+    run_acme_step "Reloading nginx" sh -c "$SUDO systemctl reload nginx || $SUDO systemctl restart nginx"
+  else
+    run_acme_step "Reloading nginx" sh -c "$SUDO service nginx reload || $SUDO service nginx restart"
+  fi
+}
+
 ensure_deploy_key() {
   mkdir -p "$HOME/.ssh"
   chmod 700 "$HOME/.ssh"
@@ -404,6 +455,10 @@ install_panel() {
   write_server_env "$server_host"
   open_firewall_ports
   start_stack
+  if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
+    install_ssl_packages
+    configure_nginx_https "$server_host"
+  fi
   cleanup_project_dir_after_install
 
   echo
@@ -442,8 +497,13 @@ receive_certificate() {
     $SUDO ufw allow 443/tcp || true
   fi
 
+  configure_nginx_https "$panel_domain"
+
   echo
-  echo "Certificate files are ready:"
+  echo "HTTPS is ready:"
+  echo "https://$panel_domain"
+  echo
+  echo "Certificate files:"
   echo "Key: $ACME_KEY_FILE"
   echo "Fullchain: $ACME_FULLCHAIN_FILE"
 }
