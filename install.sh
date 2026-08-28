@@ -446,6 +446,7 @@ remove_panel() {
   printf '%s%s%s\n' "$RED" "Type DELETE to remove the panel." "$RESET"
   printf '> '
   read -r confirmed
+  confirmed="$(printf '%s' "$confirmed" | tr -cd 'A-Za-z' | tr '[:lower:]' '[:upper:]')"
   if [ "$confirmed" != "DELETE" ]; then
     echo "Remove cancelled."
     return 0
