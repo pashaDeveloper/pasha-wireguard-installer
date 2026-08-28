@@ -4,8 +4,8 @@ set -Eeuo pipefail
 # Public bootstrap installer.
 # Safe to put in a public repository: it contains no private key or token.
 
-PRIVATE_REPO_SSH_URL="${PRIVATE_REPO_SSH_URL:-git@github.com:pashaDeveloper/pasha-forever-wireguard-3.git}"
-PROJECT_DIR="${PROJECT_DIR:-$HOME/pasha-forever-wireguard-3}"
+PRIVATE_REPO_SSH_URL="${PRIVATE_REPO_SSH_URL:-git@github.com:pashaDeveloper/pasha-forever-wireguard-3-main.git}"
+PROJECT_DIR="${PROJECT_DIR:-$HOME/pasha-forever-wireguard-3-main}"
 DEPLOY_KEY_PATH="${DEPLOY_KEY_PATH:-$HOME/.ssh/pasha_forever_wireguard_deploy}"
 PANEL_PORT="${PANEL_PORT:-51821}"
 PANEL_PORT_END="${PANEL_PORT_END:-$((PANEL_PORT + 100))}"
@@ -14,8 +14,9 @@ LANG_VALUE="${LANG_VALUE:-fa}"
 PASSWORD_HASH="${PASSWORD_HASH:-\$2a\$12\$1TMRGxEHRqYIgDMhEj1Txe9HOv7FwRY0I5s5YU.v.wziEMwZ2kK8i}"
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
-ACME_KEY_FILE="${ACME_KEY_FILE:-/p}"
-ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/c}"
+ACME_CERT_BASE_DIR="${ACME_CERT_BASE_DIR:-/root/cert}"
+ACME_KEY_FILE="${ACME_KEY_FILE:-}"
+ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-}"
 REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
 NGINX_SITE_NAME="${NGINX_SITE_NAME:-pasha-panel}"
 NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
@@ -74,6 +75,16 @@ is_domain_name() {
   printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
 }
 
+normalize_domain_input() {
+  local value="$1"
+
+  value="$(printf '%s' "$value" | tr -cd 'A-Za-z0-9./:-' | tr '[:upper:]' '[:lower:]')"
+  value="${value#https://}"
+  value="${value#http://}"
+  value="${value%%/*}"
+  printf '%s' "$value"
+}
+
 detect_server_ip() {
   local ip=""
 
@@ -114,12 +125,13 @@ choose_panel_host() {
   if [ -z "$panel_domain" ]; then
     prompt_input "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):" panel_domain
   fi
+  panel_domain="$(normalize_domain_input "$panel_domain")"
 
   if [ -n "$panel_domain" ]; then
     if ! is_domain_name "$panel_domain"; then
       echo "Invalid domain: $panel_domain" >&2
       echo "Use a real domain like panel.example.com, without http:// or https://." >&2
-      exit 1
+      return 1
     fi
     CHOSEN_PANEL_HOST="$panel_domain"
   else
@@ -134,21 +146,22 @@ choose_certificate_domain() {
   if [ -z "$panel_domain" ]; then
     prompt_input "Enter panel domain for SSL (example: panel.example.com):" panel_domain
   fi
+  panel_domain="$(normalize_domain_input "$panel_domain")"
 
   if [ -z "$panel_domain" ]; then
     echo "ERROR: Domain is required for SSL certificate." >&2
-    exit 1
+    return 1
   fi
 
   if is_ipv4_address "$panel_domain"; then
     echo "ERROR: Let's Encrypt certificates require a domain, not an IP address." >&2
-    exit 1
+    return 1
   fi
 
   if ! is_domain_name "$panel_domain"; then
     echo "Invalid domain: $panel_domain" >&2
     echo "Use a real domain like panel.example.com, without http:// or https://." >&2
-    exit 1
+    return 1
   fi
 
   CHOSEN_CERTIFICATE_DOMAIN="$panel_domain"
@@ -172,15 +185,20 @@ run_acme_issue_step() {
   local panel_host="$1"
   local acme_sh="$2"
 
+  if [ -z "$panel_host" ]; then
+    echo "ERROR: Domain is required for SSL certificate." >&2
+    return 1
+  fi
+
   echo
   echo "Issuing certificate for $panel_host"
-  if "$acme_sh" --issue -d "$panel_host" --standalone; then
+  if "$acme_sh" --issue -d "$panel_host" --standalone -k ec-256; then
     return 0
   fi
 
-  if "$acme_sh" --list | grep -qE "(^|[[:space:]])${panel_host}([[:space:]]|$)"; then
+  if "$acme_sh" --list | awk -v domain="$panel_host" '$1 == domain && $0 ~ /ec-256|ecc|ECDSA/ { found=1 } END { exit !found }'; then
     echo
-    echo "Certificate for $panel_host already exists and is not due for renewal."
+    echo "ECC certificate for $panel_host already exists and is not due for renewal."
     echo "Continuing with certificate file installation."
     return 0
   fi
@@ -189,6 +207,18 @@ run_acme_issue_step() {
   echo "ERROR: Issuing certificate for $panel_host failed." >&2
   echo "Check that the domain DNS A record points to this server and that TCP port 80 is open." >&2
   exit 1
+}
+
+set_certificate_output_paths() {
+  local panel_host="$1"
+
+  if [ -z "$ACME_FULLCHAIN_FILE" ]; then
+    ACME_FULLCHAIN_FILE="$ACME_CERT_BASE_DIR/$panel_host/fullchain.pem"
+  fi
+
+  if [ -z "$ACME_KEY_FILE" ]; then
+    ACME_KEY_FILE="$ACME_CERT_BASE_DIR/$panel_host/privkey.pem"
+  fi
 }
 
 prepare_certificate_output_paths() {
@@ -225,6 +255,11 @@ issue_panel_certificate() {
   local use_cert="${PANEL_CERT:-}"
   local acme_sh="$HOME/.acme.sh/acme.sh"
 
+  if [ -z "$panel_host" ]; then
+    echo "ERROR: Domain is required for SSL certificate." >&2
+    return 1
+  fi
+
   if is_ipv4_address "$panel_host"; then
     echo
     echo "SSL certificate skipped: Let's Encrypt needs a domain, not an IP address."
@@ -255,10 +290,11 @@ issue_panel_certificate() {
 
   run_acme_step "Setting default CA to Let's Encrypt" "$acme_sh" --set-default-ca --server letsencrypt
   run_acme_step "Registering Let's Encrypt account" "$acme_sh" --register-account -m "$ACME_EMAIL"
-  run_acme_issue_step "$panel_host" "$acme_sh"
+  run_acme_issue_step "$panel_host" "$acme_sh" || return 1
 
+  set_certificate_output_paths "$panel_host"
   prepare_certificate_output_paths
-  run_acme_step "Installing certificate files" "$acme_sh" --install-cert -d "$panel_host" \
+  run_acme_step "Installing certificate files" "$acme_sh" --install-cert -d "$panel_host" --ecc \
     --key-file "$ACME_KEY_FILE" \
     --fullchain-file "$ACME_FULLCHAIN_FILE"
   $SUDO chmod 600 "$ACME_KEY_FILE"
@@ -487,9 +523,9 @@ install_panel() {
   ensure_deploy_key
   ensure_docker
   clone_or_update_private_repo
-  choose_panel_host "$(detect_server_ip)"
+  choose_panel_host "$(detect_server_ip)" || return 1
   server_host="$CHOSEN_PANEL_HOST"
-  issue_panel_certificate "$server_host"
+  issue_panel_certificate "$server_host" || return 1
   write_server_env "$server_host"
   open_firewall_ports
   start_stack
@@ -522,12 +558,16 @@ receive_certificate() {
   local panel_domain
 
   install_ssl_packages
-  choose_certificate_domain
+  choose_certificate_domain || return 1
   panel_domain="$CHOSEN_CERTIFICATE_DOMAIN"
 
   stop_nginx_for_acme
   trap 'start_nginx_after_acme' EXIT
-  PANEL_CERT=yes issue_panel_certificate "$panel_domain"
+  if ! PANEL_CERT=yes issue_panel_certificate "$panel_domain"; then
+    start_nginx_after_acme
+    trap - EXIT
+    return 1
+  fi
   start_nginx_after_acme
   trap - EXIT
 
