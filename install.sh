@@ -46,6 +46,24 @@ run_sudo() {
   fi
 }
 
+prompt_input() {
+  local prompt="$1"
+  local __resultvar="$2"
+  local value=""
+
+  if [ -r /dev/tty ]; then
+    printf '%s\n' "$prompt" > /dev/tty
+    printf '> ' > /dev/tty
+    IFS= read -r value < /dev/tty
+  else
+    printf '%s\n' "$prompt" >&2
+    printf '> ' >&2
+    IFS= read -r value
+  fi
+
+  printf -v "$__resultvar" '%s' "$value"
+}
+
 is_ipv4_address() {
   printf '%s' "$1" | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
 }
@@ -92,9 +110,7 @@ choose_panel_host() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    echo "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):" >&2
-    printf '> ' >&2
-    read -r panel_domain
+    prompt_input "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):" panel_domain
   fi
 
   if [ -n "$panel_domain" ]; then
@@ -114,9 +130,7 @@ choose_certificate_domain() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    echo "Enter panel domain for SSL (example: panel.example.com):" >&2
-    printf '> ' >&2
-    read -r panel_domain
+    prompt_input "Enter panel domain for SSL (example: panel.example.com):" panel_domain
   fi
 
   if [ -z "$panel_domain" ]; then
@@ -217,7 +231,7 @@ issue_panel_certificate() {
 
   if [ -z "$use_cert" ]; then
     echo
-    read -r -p "Issue Let's Encrypt certificate for $panel_host? Type yes to enable SSL cert option: " use_cert
+    prompt_input "Issue Let's Encrypt certificate for $panel_host? Type yes to enable SSL cert option:" use_cert
   fi
 
   if [ "$use_cert" != "yes" ]; then
@@ -227,7 +241,7 @@ issue_panel_certificate() {
   PANEL_CERT_ENABLED=1
 
   if [ -z "$ACME_EMAIL" ]; then
-    read -r -p "Enter email for Let's Encrypt account: " ACME_EMAIL
+    prompt_input "Enter email for Let's Encrypt account:" ACME_EMAIL
   fi
 
   if [ -z "$ACME_EMAIL" ]; then
@@ -349,7 +363,7 @@ ensure_deploy_key() {
   printf '%s' "$RESET"
   echo
 
-  read -r -p "After adding the deploy key, type yes to continue: " confirmed
+  prompt_input "After adding the deploy key, type yes to continue:" confirmed
   if [ "$confirmed" != "yes" ]; then
     echo "Stopped. Run this installer again after adding the deploy key."
     exit 0
@@ -401,9 +415,7 @@ write_server_env() {
   local session_secret
 
   if [ -z "$server_host" ]; then
-    echo "Server IP was not detected. Enter WG_HOST manually:"
-    printf '> '
-    read -r server_host
+    prompt_input "Server IP was not detected. Enter WG_HOST manually:" server_host
   fi
 
   session_secret="$(openssl rand -hex 32)"
@@ -557,9 +569,7 @@ remove_panel() {
 
   echo
   printf '%s%s%s\n' "$RED" "DANGER: This will remove panel containers, volumes, image, and project directory." "$RESET"
-  printf '%s%s%s\n' "$RED" "Type DELETE to remove the panel." "$RESET"
-  printf '> '
-  read -r confirmed
+  prompt_input "$(printf '%sType DELETE to remove the panel.%s' "$RED" "$RESET")" confirmed
   confirmed="$(printf '%s' "$confirmed" | tr -cd 'A-Za-z' | tr '[:lower:]' '[:upper:]')"
   if [ "$confirmed" != "DELETE" ]; then
     echo "Remove cancelled."
@@ -631,10 +641,10 @@ main() {
 
   while true; do
     print_menu
-    read -r -p "Select an option [1-4, q]: " choice
+    prompt_input "Select an option [1-4, q]:" choice
     run_menu_choice "$choice" || true
     echo
-    read -r -p "Press Enter to return to the main menu..." _
+    prompt_input "Press Enter to return to the main menu..." _
   done
 }
 
