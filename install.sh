@@ -92,8 +92,8 @@ choose_panel_host() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    echo "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):"
-    printf '> '
+    echo "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):" >&2
+    printf '> ' >&2
     read -r panel_domain
   fi
 
@@ -114,8 +114,8 @@ choose_certificate_domain() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    echo "Enter panel domain for SSL (example: panel.example.com):"
-    printf '> '
+    echo "Enter panel domain for SSL (example: panel.example.com):" >&2
+    printf '> ' >&2
     read -r panel_domain
   fi
 
