@@ -508,16 +508,12 @@ print_menu() {
   echo "2) Receive SSL certificate"
   echo "3) Panel information"
   printf '%s4) Remove panel%s\n' "$RED" "$RESET"
+  echo "q) Exit"
   echo
 }
 
-main() {
-  local choice="${1:-}"
-
-  if [ -z "$choice" ]; then
-    print_menu
-    read -r -p "Select an option [1-4]: " choice
-  fi
+run_menu_choice() {
+  local choice="$1"
 
   case "$choice" in
     1|install)
@@ -532,12 +528,31 @@ main() {
     4|remove|delete|uninstall)
       remove_panel
       ;;
+    q|Q|quit|exit)
+      exit 0
+      ;;
     *)
       echo "Invalid option: $choice" >&2
-      print_menu
-      exit 1
+      return 1
       ;;
   esac
+}
+
+main() {
+  local choice="${1:-}"
+
+  if [ -n "$choice" ]; then
+    run_menu_choice "$choice"
+    return
+  fi
+
+  while true; do
+    print_menu
+    read -r -p "Select an option [1-4, q]: " choice
+    run_menu_choice "$choice" || true
+    echo
+    read -r -p "Press Enter to return to the main menu..." _
+  done
 }
 
 main "$@"
