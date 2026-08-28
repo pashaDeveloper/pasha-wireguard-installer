@@ -14,8 +14,8 @@ LANG_VALUE="${LANG_VALUE:-fa}"
 PASSWORD_HASH="${PASSWORD_HASH:-\$2a\$12\$1TMRGxEHRqYIgDMhEj1Txe9HOv7FwRY0I5s5YU.v.wziEMwZ2kK8i}"
 PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
-ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
-ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
+ACME_KEY_FILE="${ACME_KEY_FILE:-/p}"
+ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/c}"
 REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
 NGINX_SITE_NAME="${NGINX_SITE_NAME:-pasha-panel}"
 NGINX_AVAILABLE_DIR="${NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
@@ -92,7 +92,9 @@ choose_panel_host() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    read -r -p "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host): " panel_domain
+    echo "Enter panel domain for WG_HOST/SSL, or press Enter to use detected IP ($detected_host):"
+    printf '> '
+    read -r panel_domain
   fi
 
   if [ -n "$panel_domain" ]; then
@@ -112,7 +114,9 @@ choose_certificate_domain() {
 
   echo >&2
   if [ -z "$panel_domain" ]; then
-    read -r -p "Enter panel domain for SSL (example: panel.example.com): " panel_domain
+    echo "Enter panel domain for SSL (example: panel.example.com):"
+    printf '> '
+    read -r panel_domain
   fi
 
   if [ -z "$panel_domain" ]; then
@@ -171,6 +175,24 @@ run_acme_issue_step() {
   exit 1
 }
 
+prepare_certificate_output_paths() {
+  local key_dir
+  local fullchain_dir
+
+  key_dir="$(dirname "$ACME_KEY_FILE")"
+  fullchain_dir="$(dirname "$ACME_FULLCHAIN_FILE")"
+
+  if [ "$key_dir" != "/" ]; then
+    run_sudo mkdir -p "$key_dir"
+    run_sudo chown "$(id -u):$(id -g)" "$key_dir"
+  fi
+
+  if [ "$fullchain_dir" != "/" ] && [ "$fullchain_dir" != "$key_dir" ]; then
+    run_sudo mkdir -p "$fullchain_dir"
+    run_sudo chown "$(id -u):$(id -g)" "$fullchain_dir"
+  fi
+}
+
 install_acme_if_needed() {
   if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
     run_acme_step "Installing acme.sh" sh -c "curl -fsSL https://get.acme.sh | sh"
@@ -219,8 +241,7 @@ issue_panel_certificate() {
   run_acme_step "Registering Let's Encrypt account" "$acme_sh" --register-account -m "$ACME_EMAIL"
   run_acme_issue_step "$panel_host" "$acme_sh"
 
-  $SUDO mkdir -p "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
-  $SUDO chown "$(id -u):$(id -g)" "$(dirname "$ACME_KEY_FILE")" "$(dirname "$ACME_FULLCHAIN_FILE")"
+  prepare_certificate_output_paths
   run_acme_step "Installing certificate files" "$acme_sh" --install-cert -d "$panel_host" \
     --key-file "$ACME_KEY_FILE" \
     --fullchain-file "$ACME_FULLCHAIN_FILE"
@@ -380,7 +401,9 @@ write_server_env() {
   local session_secret
 
   if [ -z "$server_host" ]; then
-    read -r -p "Server IP was not detected. Enter WG_HOST manually: " server_host
+    echo "Server IP was not detected. Enter WG_HOST manually:"
+    printf '> '
+    read -r server_host
   fi
 
   session_secret="$(openssl rand -hex 32)"
