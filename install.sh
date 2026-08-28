@@ -16,6 +16,7 @@ PANEL_DOMAIN="${PANEL_DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-orebu@tmvaswgcsdlcscaacsafdvgfdbybudc.com}"
 ACME_KEY_FILE="${ACME_KEY_FILE:-/etc/ssl/pasha-panel/panel.key}"
 ACME_FULLCHAIN_FILE="${ACME_FULLCHAIN_FILE:-/etc/ssl/pasha-panel/fullchain.cer}"
+REMOVE_PROJECT_AFTER_INSTALL="${REMOVE_PROJECT_AFTER_INSTALL:-yes}"
 PANEL_CERT_ENABLED=0
 NGINX_WAS_ACTIVE=0
 RED=$'\033[31m'
@@ -360,8 +361,35 @@ open_firewall_ports() {
 }
 
 start_stack() {
-  cd "$PROJECT_DIR"
-  $SUDO docker compose --env-file .env up -d --build
+  (cd "$PROJECT_DIR" && $SUDO docker compose --env-file .env up -d --build)
+}
+
+cleanup_project_dir_after_install() {
+  local project_real=""
+  local cwd_real=""
+
+  if [ "$REMOVE_PROJECT_AFTER_INSTALL" != "yes" ]; then
+    return 0
+  fi
+
+  if [ ! -d "$PROJECT_DIR" ]; then
+    return 0
+  fi
+
+  project_real="$(cd "$PROJECT_DIR" && pwd -P)"
+  cwd_real="$(pwd -P)"
+
+  if [ "$project_real" = "$cwd_real" ]; then
+    echo
+    echo "Project directory was not removed because the installer is running from it:"
+    echo "$project_real"
+    return 0
+  fi
+
+  echo
+  echo "Removing downloaded project directory:"
+  echo "$project_real"
+  run_sudo rm -rf "$project_real"
 }
 
 install_panel() {
@@ -376,8 +404,7 @@ install_panel() {
   write_server_env "$server_host"
   open_firewall_ports
   start_stack
-
-  server_host="$(grep '^WG_HOST=' "$PROJECT_DIR/.env" | cut -d= -f2-)"
+  cleanup_project_dir_after_install
 
   echo
   echo "Panel is starting:"
@@ -391,7 +418,11 @@ install_panel() {
   fi
   echo
   echo "WireGuard UDP port: $WG_PORT"
-  echo "Private project directory: $PROJECT_DIR"
+  if [ -d "$PROJECT_DIR" ]; then
+    echo "Private project directory: $PROJECT_DIR"
+  else
+    echo "Private project directory removed after install: $PROJECT_DIR"
+  fi
 }
 
 receive_certificate() {
