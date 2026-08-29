@@ -9,7 +9,6 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/pasha-forever-wireguard-3-main}"
 DEPLOY_KEY_PATH="${DEPLOY_KEY_PATH:-$HOME/.ssh/pasha_forever_wireguard_deploy}"
 PANEL_PORT="${PANEL_PORT:-51821}"
 PANEL_PORT_END="${PANEL_PORT_END:-$((PANEL_PORT + 100))}"
-PANEL_HTTPS_PORT="${PANEL_HTTPS_PORT:-443}"
 WG_PORT="${WG_PORT:-51820}"
 LANG_VALUE="${LANG_VALUE:-fa}"
 PASSWORD_HASH="${PASSWORD_HASH:-\$2a\$12\$1TMRGxEHRqYIgDMhEj1Txe9HOv7FwRY0I5s5YU.v.wziEMwZ2kK8i}"
@@ -338,12 +337,6 @@ start_nginx_after_acme() {
 configure_nginx_https() {
   local panel_domain="$1"
   local panel_port="${PANEL_PORT:-51821}"
-  local https_port="${PANEL_HTTPS_PORT:-443}"
-  local https_port_suffix=""
-
-  if [ "$https_port" != "443" ]; then
-    https_port_suffix=":$https_port"
-  fi
 
   run_sudo mkdir -p "$NGINX_AVAILABLE_DIR" "$NGINX_ENABLED_DIR"
 
@@ -353,12 +346,12 @@ server {
     listen [::]:80;
     server_name $panel_domain;
 
-    return 301 https://\$host$https_port_suffix\$request_uri;
+    return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen $https_port ssl http2;
-    listen [::]:$https_port ssl http2;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $panel_domain;
 
     ssl_certificate $ACME_FULLCHAIN_FILE;
@@ -487,7 +480,7 @@ open_firewall_ports() {
     $SUDO ufw allow "$PANEL_PORT/tcp" || true
     if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
       $SUDO ufw allow 80/tcp || true
-      $SUDO ufw allow "${PANEL_HTTPS_PORT:-443}/tcp" || true
+      $SUDO ufw allow 443/tcp || true
     fi
   fi
 }
@@ -549,11 +542,6 @@ install_panel() {
   if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
     echo
     echo "SSL certificate was issued for: $server_host"
-    if [ "${PANEL_HTTPS_PORT:-443}" = "443" ]; then
-      echo "HTTPS URL: https://$server_host"
-    else
-      echo "HTTPS URL: https://$server_host:$PANEL_HTTPS_PORT"
-    fi
     echo "Use these files in your HTTPS reverse proxy:"
     echo "Key: $ACME_KEY_FILE"
     echo "Fullchain: $ACME_FULLCHAIN_FILE"
@@ -586,18 +574,14 @@ receive_certificate() {
 
   if need_command ufw; then
     $SUDO ufw allow 80/tcp || true
-    $SUDO ufw allow "${PANEL_HTTPS_PORT:-443}/tcp" || true
+    $SUDO ufw allow 443/tcp || true
   fi
 
   configure_nginx_https "$panel_domain"
 
   echo
   echo "HTTPS is ready:"
-  if [ "${PANEL_HTTPS_PORT:-443}" = "443" ]; then
-    echo "https://$panel_domain"
-  else
-    echo "https://$panel_domain:$PANEL_HTTPS_PORT"
-  fi
+  echo "https://$panel_domain"
   echo
   echo "Certificate files:"
   echo "Key: $ACME_KEY_FILE"
@@ -613,7 +597,6 @@ show_panel_info() {
     . "$PROJECT_DIR/.env"
     echo "Domain/IP: ${WG_HOST:-unknown}"
     echo "Panel port: ${PANEL_PORT:-51821}"
-    echo "HTTPS port: ${PANEL_HTTPS_PORT:-443}"
     echo "WireGuard UDP port: ${WG_PUBLISHED_PORT:-${WG_PORT:-51820}}"
   else
     echo "No .env file found at $PROJECT_DIR/.env"
