@@ -447,6 +447,11 @@ clone_or_update_private_repo() {
   else
     git clone "$PRIVATE_REPO_SSH_URL" "$PROJECT_DIR"
   fi
+
+  if [ ! -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    echo "ERROR: Project was not cloned correctly. Missing $PROJECT_DIR/docker-compose.yml" >&2
+    return 1
+  fi
 }
 
 write_server_env() {
@@ -458,6 +463,11 @@ write_server_env() {
   fi
 
   session_secret="$(openssl rand -hex 32)"
+
+  if [ ! -d "$PROJECT_DIR" ]; then
+    echo "ERROR: Project directory does not exist: $PROJECT_DIR" >&2
+    return 1
+  fi
 
   {
     printf 'WG_HOST=%s\n' "$server_host"
@@ -520,19 +530,19 @@ cleanup_project_dir_after_install() {
 install_panel() {
   local server_host
 
-  install_base_packages
-  ensure_deploy_key
-  ensure_docker
-  clone_or_update_private_repo
+  install_base_packages || return 1
+  ensure_deploy_key || return 1
+  ensure_docker || return 1
+  clone_or_update_private_repo || return 1
   choose_panel_host "$(detect_server_ip)" || return 1
   server_host="$CHOSEN_PANEL_HOST"
   issue_panel_certificate "$server_host" || return 1
-  write_server_env "$server_host"
+  write_server_env "$server_host" || return 1
   open_firewall_ports
-  start_stack
+  start_stack || return 1
   if [ "$PANEL_CERT_ENABLED" -eq 1 ]; then
-    install_ssl_packages
-    configure_nginx_https "$server_host"
+    install_ssl_packages || return 1
+    configure_nginx_https "$server_host" || return 1
   fi
   cleanup_project_dir_after_install
 
