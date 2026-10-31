@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Public bootstrap only. Never put a private key or panel source in this repo.
+# Installer maintained in the main panel repository. Never embed private keys.
 set -Eeuo pipefail
 set +x
 umask 077
+
+readonly PANEL_REPOSITORY='pashaDeveloper/wg-pasha-master'
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 ask() {
@@ -59,11 +61,15 @@ prepare_key() {
   fi
   chmod 0600 "$key_file"
   pubkey=$(ssh-keygen -y -P '' -f "$key_file") || fail "Use an unencrypted deploy key. Replace $key_file and rerun."
-  printf '\nAdd this PUBLIC key to https://github.com/%s/settings/keys\n' "$repository"
-  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n\033[1;31m%s\033[0m\n\n' "$pubkey"
   # Pinned GitHub host key, from GitHub SSH fingerprint documentation.
   printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >"$config_dir/known_hosts"
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $key_file -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
+  if git ls-remote "git@github.com:$repository.git" HEAD >/dev/null 2>&1; then
+    printf 'Deploy Key access verified. Continuing installation.\n'
+    return
+  fi
+  printf '\nAdd this PUBLIC key to https://github.com/%s/settings/keys\n' "$repository"
+  printf 'Settings > Deploy keys > Add deploy key. Leave Allow write access OFF.\n\n\033[1;31m%s\033[0m\n\n' "$pubkey"
   while true; do
     ask registered '[C] Copy public key | [Enter] Check GitHub access | [Q] Cancel: '
     case "$registered" in
@@ -144,13 +150,26 @@ install_panel() {
       # but never build its stale checkout again.
       prepare_runtime
     fi
+    local reinstall_port saved_panel_port
+    saved_panel_port=$(setting PANEL_PORT)
+    ask reinstall_port "Panel TCP port [$saved_panel_port]: "
+    reinstall_port=${reinstall_port:-$saved_panel_port}
+    valid_port "$reinstall_port" || fail 'Port must be 1-65535.'
+    if [[ $reinstall_port != "$saved_panel_port" ]] && ss -H -ltn "sport = :$reinstall_port" | grep -q .; then
+      fail 'Panel TCP port is already in use.'
+    fi
     update_panel --reinstall
+    if [[ $reinstall_port != "$saved_panel_port" ]]; then
+      # Apply through the existing port-change path so HTTPS and rollback are
+      # handled consistently, including recovery when no image existed before.
+      edit_panel_port "$reinstall_port"
+    fi
     if [[ -d $install_dir && ! -L $install_dir ]]; then cleanup_source; fi
     return
   fi
   [[ ! -e $install_dir ]] || fail "$install_dir contains an incomplete installation. Check it before retrying."
   printf 'Private WireGuard panel installer — Ubuntu / Debian\n'
-  repository=pashaDeveloper/wg-pasha-master
+  repository=$PANEL_REPOSITORY
   branch=''
   printf 'Private repository: %s (default branch)\n' "$repository"
   [[ $repository =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ && $repository != */.. && $repository != */. ]] || fail 'Use OWNER/REPO, not a URL.'
@@ -207,6 +226,34 @@ require_panel() {
   [[ -x $config_dir/compose && -f $config_dir/panel.env ]] || fail 'Install the panel first (option 1).'
 }
 
+restart_panel() (
+  require_panel
+  exec 9>"$config_dir/update.lock"
+  flock -n 9 || fail 'An update or edit is already running.'
+  printf 'Restarting the panel. VPN connections may briefly disconnect.\n'
+  # Remove only this service's container, never its named data volume.
+  # Explicit teardown releases its published ports before creating a new one.
+  "$config_dir/compose" stop --timeout 30 wg-easy
+  "$config_dir/compose" rm --force wg-easy
+  if ! "$config_dir/compose" up -d --no-build --pull never --force-recreate --wait --wait-timeout 180 wg-easy; then
+    "$config_dir/compose" ps --all || true
+    "$config_dir/compose" logs --tail 50 wg-easy || true
+    printf 'UDP sockets in the configured WireGuard range:\n'
+    local first last
+    first=$(setting WG_PORT)
+    last=$(setting WG_PORT_END || setting WG_PORT)
+    if valid_port "$first" && valid_port "$last"; then
+      ss -H -uanp "sport >= :$first and sport <= :$last" || true
+    fi
+    fail 'Panel restart failed. Its old container was removed. Ports owned by other services were not changed; review the error and socket owners above.'
+  fi
+  if [[ -f $config_dir/ssl/compose.yml ]]; then
+    ssl_compose up -d --pull never --force-recreate
+  fi
+  "$config_dir/compose" ps
+  printf 'Panel restarted. Settings and VPN data were kept.\n'
+)
+
 setting() {
   # Read only simple, non-secret fields written by this installer; never source dotenv.
   local entry
@@ -243,7 +290,7 @@ receive_ssl() {
   fi
   port=$(setting PANEL_PORT)
   install -d -m 0700 "$config_dir/ssl"
-  printf '%s {\n  reverse_proxy 127.0.0.1:%s\n}\n' "$domain" "$port" >"$config_dir/ssl/Caddyfile"
+  printf '%s {\n  reverse_proxy 127.0.0.1:%s {\n    header_up X-Real-IP {http.request.remote.host}\n  }\n}\n' "$domain" "$port" >"$config_dir/ssl/Caddyfile"
   cat >"$config_dir/ssl/compose.yml" <<'SSL'
 services:
   caddy:
@@ -286,7 +333,7 @@ SSL
 
 panel_information() {
   require_panel
-  printf 'Repository: pashaDeveloper/wg-pasha-master\n'
+  printf 'Repository: %s\n' "$PANEL_REPOSITORY"
   printf 'HTTP address: http://%s:%s/\n' "$(setting INIT_HOST)" "$(setting PANEL_PORT)"
   printf 'Administrator accounts are managed in the panel. On a fresh installation, open the panel to create the first account.\n'
   printf 'WireGuard UDP ports: %s-%s\n' "$(setting WG_PORT)" "$(setting WG_PORT_END || setting WG_PORT)"
@@ -488,7 +535,7 @@ check_panel_update() (
   config_dir=/etc/wg-panel
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $config_dir/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
   local remote revision latest_file
-  remote=$(git ls-remote git@github.com:pashaDeveloper/wg-pasha-master.git HEAD) || {
+  remote=$(git ls-remote "git@github.com:$PANEL_REPOSITORY.git" HEAD) || {
     rm -f "$config_dir/update-control/latest.json"
     return 1
   }
@@ -633,11 +680,11 @@ update_panel() (
   [[ -f $config_dir/deploy_key && -f $config_dir/known_hosts ]] || fail 'The saved GitHub Deploy Key or known_hosts file is missing.'
   export GIT_SSH_COMMAND="ssh -F /dev/null -i $config_dir/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$config_dir/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
   source_dir=$(mktemp -d /opt/wg-panel-update.XXXXXXXX)
-  git clone --depth 1 git@github.com:pashaDeveloper/wg-pasha-master.git "$source_dir"
+  git clone --depth 1 "git@github.com:$PANEL_REPOSITORY.git" "$source_dir"
   revision=$(git -C "$source_dir" rev-parse HEAD)
   [[ $revision =~ ^[a-f0-9]{40,64}$ ]] || fail 'Invalid source revision.'
   printf 'Downloaded source revision: %s\n' "$revision"
-  # The public installer is published separately and is not part of the private source.
+  # The installer and panel source are maintained in the same repository.
   local required_file
   for required_file in Dockerfile src/package.json src/launcher.mjs; do
     [[ -f $source_dir/$required_file ]] || fail "Private repository revision $revision is missing $required_file. Push the panel source to the default branch."
@@ -678,8 +725,8 @@ update_panel() (
   setup_updater
   "$config_dir/compose" up -d --force-recreate --wait --wait-timeout 180
   "$config_dir/compose" exec -T wg-easy node --input-type=module -e 'import {applyPanelSettings,readPanelSettings} from "/app/launcher.mjs";applyPanelSettings(readPanelSettings("/etc/wireguard/wg-easy.db"),process.env);const http=await import(process.env.PANEL_TLS_ACTIVE === "true"?"node:https":"node:http");const r=http.get({hostname:"127.0.0.1",port:process.env.PORT,path:process.env.NUXT_APP_BASE_URL,rejectUnauthorized:false},res=>process.exit([200,301,302,303,307,308].includes(res.statusCode)?0:1));r.setTimeout(10000,()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1));'
-  # Older private repositories may bundle the installer; otherwise keep the host copy.
-  # Refresh it only after the new panel has passed its checks.
+  # Refresh the host installer from the same checked-out panel revision only
+  # after the new panel has passed its checks. Keep compatibility with old tags.
   if [[ -f $source_dir/public-installer/install.sh ]]; then
     bash -n "$source_dir/public-installer/install.sh"
     install -m 0700 "$source_dir/public-installer/install.sh" "$config_dir/updater.sh.new"
@@ -936,15 +983,40 @@ remove_tunnel() {
   remove_tunnel_directory "$selected_tunnel"
   printf 'Tunnel removed. Panel and VPN data were kept. Shared firewall rules were kept.\n'
 }
+udp2raw_fec_menu() (
+  local assets script_directory checkout runtime=/opt/wg-panel-udp2raw-fec
+  script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  assets="$script_directory/vendor/udp2raw"
+  checkout=''
+  trap 'if [[ -n $checkout ]]; then rm -rf -- "$checkout"; fi' EXIT
+  if [[ ! -f $assets/run.sh || ! -f $assets/udp2raw.go ]]; then
+    # The bootstrap/updater can run install.sh without its adjacent source files.
+    [[ -f /etc/wg-panel/deploy_key && -f /etc/wg-panel/known_hosts ]] || fail 'Repository Deploy Key not found; run the panel bootstrap first.'
+    export GIT_SSH_COMMAND="ssh -F /dev/null -i /etc/wg-panel/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/wg-panel/known_hosts -o HostKeyAlgorithms=ssh-ed25519"
+    checkout=$(mktemp -d)
+    git clone --depth 1 --filter=blob:none --sparse "git@github.com:$PANEL_REPOSITORY.git" "$checkout/source"
+    git -C "$checkout/source" sparse-checkout set public-installer/vendor/udp2raw
+    assets="$checkout/source/public-installer/vendor/udp2raw"
+  fi
+  [[ -d $assets ]] || fail 'UDP2RAW source files are missing from the repository.'
+  install -d -m 0700 "$runtime"
+  local asset
+  for asset in run.sh udp2raw.go udp2raw-logo.sh LICENSE; do
+    [[ -f $assets/$asset ]] || fail "Missing UDP2RAW asset: $asset"
+    install -m 0600 "$assets/$asset" "$runtime/$asset"
+  done
+  bash "$runtime/run.sh"
+)
+
 tunnel_menu() {
   local tunnel_choice
   while true; do
-    printf '\nWireGuard UDP tunnels\n1. Create tunnel\n2. Status\n3. Logs\n4. Start/restart\n5. Remove tunnel\n6. UDP2RAW (Iran / Outside, ICMP / UDP / FakeTCP)\nb) Back\n'
+    printf '\nTunnels\n1. UDP2RAW / FEC\n2. Create GOST tunnel\n3. GOST status\n4. GOST logs\n5. GOST start/restart\n6. Remove GOST tunnel\n7. UDP2RAW managed by panel (automatic inbounds)\nb) Back\n'
     ask tunnel_choice 'Select: '
     case "$tunnel_choice" in
-      1) run_action create_tunnel ;; 2) run_action tunnel_status ;; 3) run_action tunnel_logs ;;
-      4) run_action tunnel_restart ;; 5) run_action remove_tunnel ;;
-      6) udp2raw_menu ;; b|B) return ;;
+      1) run_action udp2raw_fec_menu ;; 2) run_action create_tunnel ;; 3) run_action tunnel_status ;;
+      4) run_action tunnel_logs ;; 5) run_action tunnel_restart ;;
+      6) run_action remove_tunnel ;; 7) udp2raw_menu ;; b|B) return ;;
       *) printf 'Invalid option.\n' ;;
     esac
   done
@@ -1594,7 +1666,7 @@ main() {
   install_dir=/opt/wg-panel
   local choice
   while true; do
-    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel / recover password\n5. WireGuard UDP tunnels\n6. Recover/change administrator password\nq) Exit\n'
+    printf '\n1. Install panel\n2. Edit panel\n3. Remove panel\n4. Update panel / recover password\n5. Tunnels\n6. Recover/change administrator password\n7. Start/restart panel\nq) Exit\n'
     ask choice 'Select an option: '
     case "$choice" in
       1) run_action install_panel ;;
@@ -1603,6 +1675,7 @@ main() {
       4) run_action update_menu ;;
       5) run_action tunnel_menu ;;
       6) run_action reset_panel_password ;;
+      7) run_action restart_panel ;;
       q|Q) return ;;
       *) printf 'Invalid option.\n' ;;
     esac
